@@ -45,7 +45,7 @@ const DEFAULT_FLUIDS = [
     rho: 793.36, 
     nu: 10.41e-6, // m2/s @ 40C
     nu_cSt_40: 10.41,
-    nu_cSt_100: 2.72, // From PDF
+    nu_cSt_100: 2.81, // Updated by user request
     k: 0.14059, 
     cp: 2110, 
     beta: 0.00092, 
@@ -206,10 +206,34 @@ const solveOperatingPoint = (
   const alpha = 0.2; 
   
   // Pressure Loss Coefficients
-  // f_correction: 1.2 accounts for surface roughness and non-ideal duct shape
-  // K_loss: 1.0 accounts for Entrance/Exit Losses
-  const f_correction_base = 1.2; 
-  const K_loss = 1.0; 
+  // Shah & London Developing Flow Friction Factor
+  // f_app * Re = 3.44 / sqrt(L+) ... simplified approx
+  const calcFrictionFactor = (Re_local: number, Dh: number, L: number) => {
+    if (Re_local < 1) return 24;
+    // Dimensionless length L+ = L / (Dh * Re)
+    const L_plus = L / (Dh * Re_local);
+    // Shah & London approx for parallel plates
+    // f_Re = 24 + (0.674 / (4 * L_plus)) / (1 + 0.00029 / (4 * L_plus)^2) ... simplified curve fit
+    // Using a simpler composite fit:
+    // Fully developed f*Re = 24
+    // Developing region adds penalty
+    const fRe_fd = 24;
+    const fRe_dev = 3.44 / Math.sqrt(L_plus);
+    const fRe_app = Math.sqrt(fRe_fd*fRe_fd + fRe_dev*fRe_dev);
+    
+    return fRe_app / Re_local;
+  };
+  
+  // Contraction and Expansion Losses (Kc, Ke) based on Area Ratio (sigma)
+  // sigma = flow_area / frontal_area
+  // For heat sink in tank, frontal area is W * (h_fin + base). This is rough approx.
+  // Better: sigma = A_c_total / (W * (h_fin + t_fin))
+  // Assuming 'W' is total width and fins fill it.
+  const sigma = (geom.s * derived.N) / (geom.W); 
+  // Kays & London approx for laminar flow
+  const Kc = 0.42 * (1 - sigma * sigma);
+  const Ke = (1 - sigma) * (1 - sigma);
+  const K_total = Kc + Ke;
 
   while (!converged && iterations < 50) {
     // A. Property Evaluation
@@ -239,26 +263,42 @@ const solveOperatingPoint = (
     const dP_buoy_total = dP_buoy_core + dP_buoy_chimney;
 
     // Resisting Pressure:
-    // 1. Viscous: f_corrected * (12 * mu * L * u) / s^2
-    // IMPROVEMENT: Apply Viscosity Ratio Correction to Friction
-    // For heating liquids (mu_wall < mu_bulk), friction is REDUCED near wall.
-    // Factor ~ (mu_wall / mu_bulk)^0.58
+    // 1. Viscous: f_corrected * (1/2 rho u^2) * (L/Dh) * 4 ? No, standard D-W is f * (L/D) * dyn_head
+    // or Hagen-Poiseuille equiv. 
+    // Using Darcy-Weisbach: dP = f * (L/Dh) * (1/2 rho u^2)
+    // where f is Apparent Friction Factor for developing flow
+    
+    // Iterative velocity required for Re-dependent Friction
+    // Simplified: Assume laminar relationship first to get coefficients
+    // But f depends on u (via Re). 
+    // Let's use the quadratic form derived from f = C/Re
+    // dP_visc = (C/Re) * (L/Dh) * 0.5 * rho * u^2 = (C * nu / (u * Dh)) * (L/Dh) * 0.5 * rho * u^2
+    // = C * nu * L * 0.5 * rho * u / Dh^2
+    // Linearly proportional to u for fully developed. 
+    // However, developing flow has sqrt terms. 
+    // Let's iterate u specifically or use a linearized friction coefficient at current Re guess.
+    
+    const u_guess = u_induced > 0 ? u_induced : 0.1;
+    const Re_guess = (u_guess * derived.Dh) / nu_bulk;
+    const f_app = calcFrictionFactor(Re_guess, derived.Dh, geom.L);
+    
+    // Viscosity Correction for Friction (Liquid Heating)
+    // Wall is hotter -> lower visc near wall -> lower friction than iso
     const mu_bulk = nu_bulk * rho_bulk;
     const mu_wall_calc = nu_wall * rho_bulk;
-    
     const visc_ratio = mu_wall_calc / mu_bulk;
-    const friction_visc_correction = Math.pow(visc_ratio, 0.58); // < 1.0 for heating
+    const friction_visc_correction = Math.pow(visc_ratio, 0.58); 
     
-    const f_effective = f_correction_base * friction_visc_correction;
+    const f_effective = f_app * friction_visc_correction;
 
-    const A_quad = 0.5 * rho_bulk * K_loss;
-    const B_quad = f_effective * (12 * mu_bulk * geom.L) / (geom.s * geom.s); 
-    const C_quad = dP_buoy_total;
+    // dP_loss = (K + f*L/Dh) * 0.5 * rho * u^2
+    const K_flow = K_total + (f_effective * geom.L / derived.Dh);
     
-    // u = (-B + sqrt(B^2 + 4AC)) / 2A
-    const discriminant = B_quad * B_quad + 4 * A_quad * C_quad;
-    u_induced = (-B_quad + Math.sqrt(discriminant)) / (2 * A_quad);
+    // Balance: dP_buoy = K_flow * 0.5 * rho * u^2
+    // u = sqrt( 2 * dP_buoy / (rho * K_flow) )
+    const u_new = Math.sqrt( (2 * dP_buoy_total) / (rho_bulk * K_flow) );
     
+    u_induced = u_induced * 0.5 + u_new * 0.5; // Smooth update
     if (u_induced < 0.0001) u_induced = 0.0001;
     
     // C. Heat Transfer
